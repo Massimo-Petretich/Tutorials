@@ -1,0 +1,1177 @@
+---
+author: "Massimo Petretich"
+date: "September 2019"
+title: "Cell Cycle Correction on Single Cell RNA-seq"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    number_sections: true
+---
+# Introduction
+In this tutorial a 10X dataset containing ~4500 cells coming from 3 samples (conditions) is analyzed. The cell-type used in this study actively divides roughly every 2 days and therefore is a good cell-model to test the cell-cycle correction on single-cell transcriptomics.
+
+# Data import from Cellranger and initial processing
+## Import the data
+In this section we will import manually the 10X outputs from Cellranger (Read10X is a builtin function in Seurat that will do this automatically).
+It is necessary to use the function 'readMM' from 'Matrix' package to store the object in a memory-efficient way.
+
+
+```{r, message=FALSE}
+library(Seurat)
+library(tidyverse)
+library(org.Hs.eg.db)
+library(Matrix)
+library(plyr)
+library(ggplot2)
+library(stats)
+
+options(max.print = 200)
+```
+
+
+```{r, eval=FALSE}
+working_directory <- "path/to/directory"
+
+setwd(working_directory)
+dir.create('./Plots')
+
+dataset_loc <- "path/to/10X/files"
+
+experiment_data <- sapply(list.files(dataset_loc), function(i){
+  matrix_dir = file.path(dataset_loc, i)
+  barcode.path <- paste0(matrix_dir, "/barcodes.tsv.gz")
+  features.path <- paste0(matrix_dir, "/features.tsv.gz")
+  matrix.path <- paste0(matrix_dir, "/matrix.mtx.gz")
+  mat <- readMM(file = matrix.path) # transcripts on rows and cells on columns
+  feature.names = read.delim(features.path, header = FALSE, stringsAsFactors = FALSE) # matrix with as many rows as transcripts, column 1 is the transcript ID, column 2 other info on the transcript from the GTF, for example the symbol
+  barcode.names = read.delim(barcode.path, header = FALSE, stringsAsFactors = FALSE) # matrix with 1 column with the cell 10X barcodes, like AAACGGGAGTGTTAGA-1
+  colnames(mat) = paste(barcode.names$V1,gsub("_", "", i), sep="_")
+  rownames(mat) = feature.names$V1
+  mat
+})
+
+sample_metadata <- sapply(list.files(dataset_loc), function(i){
+  matrix_dir = file.path(dataset_loc, i)
+  barcode.path <- paste0(matrix_dir, "/barcodes.tsv.gz")
+  barcode.names = read.delim(barcode.path, header = FALSE, stringsAsFactors = FALSE)
+  df<-as.matrix(data.frame(sample_id = barcode.names$V1, condition = rep(i,length(barcode.names$V1))))
+  df
+})
+
+```
+
+## Exploratory stats
+Here we just load a table containing the mitochondrial genes with corresponding ENSEMBL annotation. The mitochondrial gene list can be found at the Broad institute's website: https://www.broadinstitute.org/scientific-community/science/programs/metabolic-disease-program/publications/mitocarta/mitocarta-in-0 <br>
+The conversion from SYMBOL to ENSEMBL was premade using the 'select' function from the 'org.Hs.eg.db' package. <br>
+The % of mitochondrial reads is computed and stored in the 'sample_metadata' object.
+
+```{r, eval=FALSE}
+mitoCarta_2.0 <- read.table("MitoCarta_human_nuclear_mitochondrial_genes_reduced.csv", sep = ",", head = T, stringsAsFactors = F)
+mito_genes <- rownames(experiment_data)[rownames(experiment_data) %in% mitoCarta_2.0$EnsemblGeneID]
+
+sample_metadata$percent_mito <- Matrix::colSums(experiment_data[mito_genes, ]) / Matrix::colSums(experiment_data)
+sample_metadata$detected_genes <- apply(experiment_data, MARGIN = 2, FUN = function(c) sum(c > 0))
+sample_metadata$detected_UMI <- apply(experiment_data, MARGIN = 2, FUN = sum)
+
+rm(list = c("mitoCarta_2.0", "mito_genes", "dataset_loc"))
+```
+
+```{r, eval=FALSE}
+ggplot(sample_metadata) + geom_bar(aes(x=condition, fill = condition))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Cell_count.jpg" height="200" />
+Cell count per condition
+
+```{r, eval=FALSE}
+ggplot(sample_metadata) + geom_point(aes(x=detected_UMI, y=detected_genes, colour = condition), alpha = 0.5, , size = 0.2)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/UMI_vs_genes.png" height="300" />
+Labeling by condition
+
+```{r, eval=FALSE}
+ggplot(sample_metadata) + geom_boxplot(aes(x = condition, y = detected_genes), outlier.shape=NA) 
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Boxplot_Detected_genes.jpg" height="200" />
+
+
+```{r, eval=FALSE}
+ggplot(sample_metadata) + geom_boxplot(aes(x = condition, y = detected_UMI), outlier.shape=NA) + coord_cartesian(ylim =c(0, 50000))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Boxplot_Detected_UMI.jpg" height="200" />
+
+
+```{r, eval=FALSE}
+ggplot(sample_metadata) + geom_boxplot(aes(x = condition, y = percent_mito)) + coord_cartesian(ylim =c(0, 1))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Boxplot_mitoc_perc.jpg" height="200" />
+
+
+# Seurat pre-processing
+This section follows very closely the workflow explained by the Seurat developers on the following vignette: https://satijalab.org/seurat/v3.1/pbmc3k_tutorial.html. <br>
+For more in-detail explanation of the procedure please refer to the developer's tutorial. <br>
+
+## Object creation
+In this section a Seurat object containing the count matrix and the metadata information is created. If desired, new sample names can be assigned.
+
+```{r, eval = FALSE}
+sl <- CreateSeuratObject(
+  counts = experiment_data,
+  project = "scRNA-seq from 10X", 
+  min.cells = 3,
+  min.features = 2000,
+  names.field = 2,
+  names.delim = "\\_",
+  meta.data = sample_metadata
+)
+
+rm(list = c("experiment_data", "sample_metadata", "metadata_csv"))
+
+# The 'Seurat' class is an S4 class: isS4(sl) returns TRUE
+
+# To access the different objects inside the 'Seurat' class the syntax is slightly different than in pure R (for example list objects are accessed by '$'), in seurat '$' is used to access metadata columns. 
+
+# In order to access the different Seurat objects we can use the standard R syntax: 
+# names(sl) --> "RNA"     "RNA_nn"  "RNA_snn" "pca"     "tsne". For example: sl[["RNA"]]. 
+
+# This object is in turn an S4 object: 
+# isS4(sl[['RNA']]) --> TRUE. 
+
+# If we want the UMI counts (or other datasets like the normalized or scaled datasets) we access it by: 
+# sl[["RNA"]]@counts
+
+sl@active.ident <- revalue(sl@active.ident, c("Sample1"="Condition_1", "Sample2"="Condition_1","Sample3"="Condition_1"))
+
+VlnPlot(object = sl, features = "detected_genes", nCol = 3, point.size.use = 0.03, size.title.use = 16, x.lab.rot = T)
+VlnPlot(object = sl, features = "detected_UMI", nCol = 3, point.size.use = 0.03, size.title.use = 16, x.lab.rot = T)
+VlnPlot(object = sl, features = "percent_mito", nCol = 3, point.size.use = 0.03, size.title.use = 16, x.lab.rot = T)
+
+sl_original <- sl # the reason why we create a duplicated of the 'sl' object will be clear on the "Uncorrected" section
+```
+
+## Filtering out undesired cells
+In this step we use the 'subset' function to remove cells with low number of detected genes (low complexity) and high mithocondrial content (marker of cellular stress). Regarding the latter, in this particular dataset the cells had high viability and this step could have been omitted.
+
+```{r, eval=FALSE}
+sl <- subset(sl, subset = percent_mito < 0.2 & percent_mito > 0)
+sl <- subset(sl, subset = detected_genes < 5500 & detected_genes > 2000)
+
+VlnPlot(object = sl, features = "detected_genes", nCol = 3, point.size.use = 0.03, size.title.use = 16, x.lab.rot = T)
+```
+
+
+## Normalization
+In this step the transcript's UMI counts are normalized by the total expression, meaning that the count variation due to different sequencing depth between samples or different cells is adjusted. This step is performed algebrically and therefore it runs very fast.
+
+```{r, eval=FALSE}
+sl <- NormalizeData(object = sl, normalization.method = "LogNormalize", scale.factor = 1e4)
+```
+
+## Regressing-out unwanted variation
+What this step does is to remove (regressing-out) variation that correlates with an independent variable not of interest. <br>
+For example, imagine that we were interested in identifying the effect of different life-styles on body-weight. In this case the result would be confounded by an unwanted variable, namely, the persons' sizes, which in this particular example drive the majority of the variation. To remove the correlation between the body-weight and person's size it is necessary to fit a linear model and extract the residual variation (residuals). <br> 
+Even though the model that is fit in this step is more complex than the one in the case just described, the function 'ScaleData' at its core does this. <br>
+Due to the fact that 'ScaleData' needs to fit thousands of models, this step can be very time-consuming (specially for relatively large datasets like this one (~4500 cells)).
+
+```{r, eval=FALSE}
+sl <- ScaleData(sl, vars.to.regress = c("detected_UMI", "percent_mito"))  # time consuming ~45'
+```
+
+
+
+
+
+
+
+
+# Cel-cycle correction
+The workflow is described in details at the developers' website: https://satijalab.org/seurat/v3.1/cell_cycle_vignette.html <br><br>
+The purpose of this study is not limited to repeat that procedure, but rather, to test its robustness. An additional goal of this study is to establish a method robust enough to work on any human cell-type. The major steps are listed below.<br>
+  1) Score each cell for a distinct cell-cycle phase (S, G2-M) using cell-cycle marker genes obtained from single-cells based papers Macosko EZ ea al., 2015, (Table S2) https://pubmed.ncbi.nlm.nih.gov/26000488/; and Tirosh I et al., 2016 https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4944528/. <br>
+  2) Regress-out the gene expression correlating with the cell-cycle phases scores. <br>
+  3) Perform dimension reduction and identify the proportion of the variance explained by the cell-cycle and by the different experimental conditions on the datasets corrected using the different cell-cycle marker genes as well as on the uncorrected dataset <br>
+  4) Implement a method for selecting marker-genes specific for the cell-type used (might be different from the cell-types used in the publications above). <br><br>
+
+Importantly, the points above refer to the objectives of the tutorial, the workflow itself will not follow the same passages, but rather it will be grouped by dataset, meaning that 1,2,3 will be implemented independently for the 2 independent correction (based on the marker genes provided in the Macosko and Tirosh papers), for the method described at point 4 and for the uncorrected dataset. <br>
+
+
+## Uncorrected (reference) dataset
+For this passage we will perform the standard workflow started above and described on the 'general' vignette.<br>
+Although we will not apply any cell-cycle correction, we still need to score each cell in the dataset for a cell-cycle phase. For this step we will use the cell-cycle marker-genes provided on the Macosko EZ  paper.
+
+### Cell-Cycle scoring
+```{r, eval=FALSE}
+dir.create("path/to/directory/Plots/Uncorrected")
+setwd("path/to/directory/Plots/Uncorrected")
+
+cc <- read.table("../../Macosko_EZ_2015_Table_S2_Cell_cycle_genes_human.csv", head = T, sep = ",", stringsAsFactors = F)
+
+cc_list <- list(G1_S = select(org.Hs.eg.db, keys = cc$G1.S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2], 
+                G2_M = select(org.Hs.eg.db, keys = cc$G2.M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                S = select(org.Hs.eg.db, keys = cc$S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                M = select(org.Hs.eg.db, keys = cc$M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                M_G1 = select(org.Hs.eg.db, keys = cc$M.G1, columns = "ENSEMBL", keytype = "SYMBOL")[, 2]
+)
+
+cc_list <- lapply(cc_list, function(x) {x <- x[! is.na(x)]; x <- x[! duplicated(x)]; return(x)})
+
+sl <- CellCycleScoring(sl, s.features = c(cc_list$G1_S, cc_list$S), g2m.features = c(cc_list$G2_M, cc_list$M), set.ident = TRUE) 
+sl <- RunPCA(sl, features = c(cc_list$G1_S, cc_list$G2_M, cc_list$S, cc_list$M, cc_list$M_G1))
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg")
+PCAPlot(object = sl, dims = c(1,2), pt.size = 2)
+dev.off()
+
+rm(list = c("cc"))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Uncorrected/PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg" height="300" />
+
+### Dimension reduction: 
+#### Find variable genes and run the PCA
+```{r, eval=FALSE}
+sl@meta.data[, "old.ident"] <- sl@meta.data[, "orig.ident"]
+sl@meta.data[, "old.ident"] <- revalue(sl@meta.data[, "old.ident"], c("Sample1"="Condition_1", "Sample2"="Condition_1","Sample3"="Condition_1"))
+sl@active.ident <- sl@meta.data[, "old.ident"]
+names(sl@active.ident) <- rownames(sl@meta.data)  # important to name the object
+
+sl <- FindVariableFeatures(object = sl, 
+                           mean.function = ExpMean, 
+                           dispersion.function = LogVMR, 
+                           mean.cutoff = c(0.025, 8)
+)
+
+jpeg("./Variable_features.jpg")
+VariableFeaturePlot(sl)
+dev.off()
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Uncorrected/Variable_features_cell_cycle_corrected.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+sl <- RunPCA(object = sl, features = sl[["RNA"]]@var.features, do.print = F, pcs.compute = 100) # the PCA is run using only the variable genes previously identified
+
+jpeg("./PCA_top_variable_genes.jpg")
+PCAPlot(object = sl, dims = c(1,2), pt.size = 2)
+dev.off()
+
+jpeg("./PCA_top_variable_genes_PC1_PC3.jpg")
+PCAPlot(object = sl, dims = c(1,3), pt.size = 2)
+dev.off()
+
+jpeg("./PCA_top_variable_genes_component_loadings.jpg")
+barplot(sl[["pca"]]@stdev^2 / sum(sl[["pca"]]@stdev^2), 
+        names.arg = paste("PC ", 1:length(sl[["pca"]]@stdev)), 
+        las = 2, 
+        cex.names = 0.5, 
+        ylab = "Proportion of variance explained"
+)
+dev.off()
+```
+
+
+#### tSNE
+```{r, eval=FALSE}
+sl <- RunTSNE(object = sl, dims = 1:5)
+
+tsne <- TSNEPlot(object = sl)
+sl@meta.data <- cbind(sl@meta.data, tsne$data)
+rm(tsne)
+
+ggplot(sl@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./tSNE_cell_cycle_phase.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Uncorrected/tSNE_cell_cycle_phase_cell_cycle_corrected.jpg" alt="Labeling by cell-cycle phase" height="300" />
+
+```{r, eval=FALSE}
+ggplot(sl@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./tSNE_conditions.jpg", device = "jpeg", width = 6, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Uncorrected/tSNE_conditions_cell_cycle_corrected.jpg" alt="Labeling by condition" height="300" />
+Labeling by condition
+
+#### UMAP
+The function RunUMAP runs in Python 3 and requires the installation of the module 'umap-learn'. In the general vignette this is mentioned, I suggest installing conda before doing so.
+
+```{r, eval=FALSE}
+sl <- RunUMAP(sl, dims = 1:5)
+UMAP <- UMAPPlot(object = sl)
+sl@meta.data <- cbind(sl@meta.data, UMAP$data[, grep("UMAP", colnames(UMAP$data))])
+rm(UMAP)
+
+ggplot(sl@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./UMAP_cell_cycle_phase.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Uncorrected/UMAP_cell_cycle_phase_cell_cycle_corrected.jpg" alt="Labeling by condition" height="300" />
+
+```{r, eval=FALSE}
+ggplot(sl@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./UMAP_conditions.jpg", device = "jpeg", width = 6, height = 4)
+
+rm(cc_list)
+
+save(sl, file = "../../sl.RData")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Uncorrected/UMAP_conditions_cell_cycle_corrected.jpg" alt="Labeling by condition" height="300" />
+Labeling by condition
+
+
+
+## Cell-Cycle correction based on the cell-cycle marker-genes from Macosko et al,. 2015  
+### Cell-Cycle scoring
+```{r, eval=FALSE}
+sl_Macosko <- sl_original
+
+dir.create("path/to/directory/Plots/Uncorrected/Plots/Macosko")
+setwd("path/to/directory/Plots/Uncorrected/Plots/Macosko")
+
+cc <- read.table("../../Macosko_EZ_2015_Table_S2_Cell_cycle_genes_human.csv", head = T, sep = ",", stringsAsFactors = F)
+
+cc_list <- list(G1_S = select(org.Hs.eg.db, keys = cc$G1.S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2], 
+                G2_M = select(org.Hs.eg.db, keys = cc$G2.M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                S = select(org.Hs.eg.db, keys = cc$S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                M = select(org.Hs.eg.db, keys = cc$M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                M_G1 = select(org.Hs.eg.db, keys = cc$M.G1, columns = "ENSEMBL", keytype = "SYMBOL")[, 2]
+)
+
+cc_list <- lapply(cc_list, function(x) {x <- x[! is.na(x)]; x <- x[! duplicated(x)]; return(x)})
+
+sl_Macosko <- CellCycleScoring(sl_Macosko, s.features = c(cc_list$G1_S, cc_list$S), g2m.features = c(cc_list$G2_M, cc_list$M), set.ident = TRUE) 
+
+sl_Macosko <- RunPCA(sl_Macosko, features = c(cc_list$G1_S, cc_list$G2_M, cc_list$S, cc_list$M, cc_list$M_G1))
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg") # to be compared to the "...cell_cycle_corrected.jpeg"
+  PCAPlot(object = sl_Macosko, dims = c(1,2), pt.size = 2)
+dev.off()
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko/PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg" height="300" />
+<br>
+This PCA was run using the cell-cycle markerg genes and shows the clear clustering of the cells according to the marker-genes expression (this shows that the set of genes used defines 3 populations of cells, possibly belonging to the indicated cell-cycle phases).
+
+### Cell-cycle correction
+```{r, eval=FALSE}
+sl_Macosko <- ScaleData(sl_Macosko, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(sl_Macosko)) 
+
+sl_Macosko <- RunPCA(sl_Macosko, features = c(cc_list$G1_S, cc_list$G2_M)) 
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_corrected.jpg") # This shows that the correction for the cell-cycle effect is already visible om the PCA
+  PCAPlot(object = sl_Macosko, dims = c(1,2), pt.size = 2)
+dev.off()
+
+rm(list = c("cc"))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko/PCA_cell_cycle_genes_cell_cycle_corrected.jpg" height="300" />
+<br>
+This PCA was also run using the cell-cycle markerg genes and shows that after regressing out the cell-cycle variables, there is no longer cell-cycle driven clustering.
+
+### Dimension reduction
+#### Find variable genes and run the PCA
+```{r, eval=FALSE}
+sl_Macosko@meta.data[, "old.ident"] <- sl_Macosko@meta.data[, "orig.ident"]
+sl_Macosko@meta.data[, "old.ident"] <- revalue(sl_Macosko@meta.data[, "old.ident"], c("Sample1"="Condition_1", "Sample2"="Condition_1","Sample3"="Condition_1"))
+sl_Macosko@active.ident <- sl_Macosko@meta.data[, "old.ident"]
+names(sl_Macosko@active.ident) <- rownames(sl_Macosko@meta.data)  # important to name the object 
+
+sl_Macosko <- FindVariableFeatures(object = sl_Macosko, 
+                           mean.function = ExpMean, 
+                           dispersion.function = LogVMR, 
+                           mean.cutoff = c(0.025, 8)
+)
+
+jpeg("./Variable_features_cell_cycle_corrected.jpg")
+  VariableFeaturePlot(sl_Macosko)
+dev.off()
+
+sl_Macosko <- RunPCA(object = sl_Macosko, features = sl_Macosko[["RNA"]]@var.features, do.print = F, pcs.compute = 100)
+
+jpeg("./PCA_top_variable_genes_cell_cycle_corrected.jpg")
+  PCAPlot(object = sl_Macosko, dims = c(1,2), pt.size = 2)
+dev.off()
+
+jpeg("./PCA_top_variable_genes_PC1_PC3_cell_cycle_corrected.jpg")
+  PCAPlot(object = sl_Macosko, dims = c(1,3), pt.size = 2)
+dev.off()
+```
+
+
+```{r, eval=FALSE}
+jpeg("./PCA_top_variable_genes_component_loadings_cell_cycle_corrected.jpg")
+barplot(sl_Macosko[["pca"]]@stdev^2 / sum(sl_Macosko[["pca"]]@stdev^2), 
+        names.arg = paste("PC ", 1:length(sl_Macosko[["pca"]]@stdev)), 
+        las = 2, 
+        cex.names = 0.5, 
+        ylab = "Proportion of variance explained"
+)
+dev.off()
+```
+
+#### tSNE
+```{r, eval=FALSE}
+sl_Macosko <- RunTSNE(object = sl_Macosko, dims = 1:5)
+
+tsne <- TSNEPlot(object = sl_Macosko)
+sl_Macosko@meta.data <- cbind(sl_Macosko@meta.data, tsne$data)
+rm(tsne)
+
+ggplot(sl_Macosko@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./tSNE_cell_cycle_phase_cell_cycle_corrected.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko/tSNE_cell_cycle_phase_cell_cycle_corrected.jpg" height="300" />
+
+```{r, eval=FALSE}
+ggplot(sl_Macosko@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") + 
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./tSNE_conditions_cell_cycle_corrected.jpg", device = "jpeg", width = 6, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko/tSNE_conditions_cell_cycle_corrected.jpg" height="300" />
+Labeling by condition
+
+#### UMAP
+```{r, eval=FALSE}
+sl_Macosko <- RunUMAP(sl_Macosko, dims = 1:5)
+UMAP <- UMAPPlot(object = sl_Macosko)
+sl_Macosko@meta.data <- cbind(sl_Macosko@meta.data, UMAP$data[, grep("UMAP", colnames(UMAP$data))])
+rm(UMAP)
+
+ggplot(sl_Macosko@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") + 
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./UMAP_cell_cycle_phase_cell_cycle_corrected.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko/UMAP_cell_cycle_phase_cell_cycle_corrected.jpg" height="300" />
+
+```{r, eval=FALSE}
+ggplot(sl_Macosko@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./UMAP_conditions_cell_cycle_corrected.jpg", device = "jpeg", width = 6, height = 4)
+
+save(sl_Macosko, file = "../../sl_Macosko.RData")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko/UMAP_conditions_cell_cycle_corrected.jpg" height="300" />
+Labeling by condition
+
+
+
+
+
+
+
+
+
+
+## Cell-Cycle correction based on the cell-cycle marker-genes from Tirosh et al,. 2016  
+### Cell-Cycle scoring
+```{r, eval=FALSE}
+sl_Tirosh <- sl
+
+dir.create("path/to/directory/Plots/Plots/Tirosh")
+setwd("path/to/directory/Plots/Plots/Tirosh")
+
+cc <- read.table("../../Cell_Cycle_genes_human.csv", head = T, sep = ",", stringsAsFactors = F)
+
+cc_list <- list(G1_S = select(org.Hs.eg.db, keys = cc$G1.S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2], 
+                G2_M = select(org.Hs.eg.db, keys = cc$G2.M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2]
+                )
+
+cc_list <- lapply(cc_list, function(x) {x <- x[! is.na(x)]; x <- x[! duplicated(x)]; return(x)})
+
+sl_Tirosh <- CellCycleScoring(sl_Tirosh, s.features = c(cc_list$G1_S, cc_list$S), g2m.features = c(cc_list$G2_M, cc_list$M), set.ident = TRUE) #### cell cycle scoring
+
+sl_Tirosh <- RunPCA(sl_Tirosh, features = c(cc_list$G1_S, cc_list$G2_M, cc_list$S, cc_list$M, cc_list$M_G1))
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg")
+PCAPlot(object = sl_Tirosh, dims = c(1,2), pt.size = 2)
+dev.off()
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh/PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg" height="300" />
+<br>
+Even though the dataset is the same as the one above (the original sl dataset), the marker genes used for the PCA are not the same, therefore the actual picture looks slightly different. Also, the cell-cycle phase classification is not identical between the 2 cases (for more info, please look at the final stats section).
+
+### Cell-cycle correction
+```{r, eval=FALSE}
+sl_Tirosh <- ScaleData(sl_Tirosh, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(sl_Tirosh))
+sl_Tirosh <- RunPCA(sl_Tirosh, features = c(cc_list$G1_S, cc_list$G2_M))
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_corrected.jpg")
+PCAPlot(object = sl_Tirosh, dims = c(1,2), pt.size = 2)
+dev.off()
+
+rm(list = c("cc"))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh/PCA_cell_cycle_genes_cell_cycle_corrected.jpg" height="300" />
+<br>
+The Tirosh marker-gene set also allows to remove the clustering driven by the cell-cycle phases.
+
+### Dimension reduction
+#### Find variable genes and run the PCA
+```{r, eval=FALSE}
+sl_Tirosh@meta.data[, "old.ident"] <- sl_Tirosh@meta.data[, "orig.ident"]
+sl_Tirosh@meta.data[, "old.ident"] <- revalue(sl_Tirosh@meta.data[, "old.ident"], c("Sample1"="DMSO_PMA-", "Sample2"="DMSO_PMA+","Sample4"="iBET_PMA+"))
+sl_Tirosh@active.ident <- sl_Tirosh@meta.data[, "old.ident"]
+names(sl_Tirosh@active.ident) <- rownames(sl_Tirosh@meta.data)  # important to name the object 
+
+sl_Tirosh <- FindVariableFeatures(object = sl_Tirosh, 
+                                  mean.function = ExpMean, 
+                                  dispersion.function = LogVMR, 
+                                  mean.cutoff = c(0.025, 8)
+)
+
+jpeg("./Variable_features_cell_cycle_corrected.jpg")
+VariableFeaturePlot(sl_Tirosh)
+dev.off()
+
+sl_Tirosh <- RunPCA(object = sl_Tirosh, features = sl_Tirosh[["RNA"]]@var.features, do.print = F, pcs.compute = 100)
+
+jpeg("./PCA_top_variable_genes_cell_cycle_corrected.jpg")
+PCAPlot(object = sl_Tirosh, dims = c(1,2), pt.size = 2)
+dev.off()
+
+jpeg("./PCA_top_variable_genes_PC1_PC3_cell_cycle_corrected.jpg")
+PCAPlot(object = sl_Tirosh, dims = c(1,3), pt.size = 2)
+dev.off()
+```
+
+
+```{r, eval=FALSE}
+jpeg("./PCA_top_variable_genes_component_loadings_cell_cycle_corrected.jpg")
+barplot(sl_Tirosh[["pca"]]@stdev^2 / sum(sl_Tirosh[["pca"]]@stdev^2), 
+        names.arg = paste("PC ", 1:length(sl_Tirosh[["pca"]]@stdev)), 
+        las = 2, 
+        cex.names = 0.5, 
+        ylab = "Proportion of variance explained"
+)
+dev.off()
+```
+
+#### tSNE
+```{r, eval=FALSE}
+sl_Tirosh <- RunTSNE(object = sl_Tirosh, dims = 1:5)
+
+tsne <- TSNEPlot(object = sl_Tirosh)
+sl_Tirosh@meta.data <- cbind(sl_Tirosh@meta.data, tsne$data)
+rm(tsne)
+
+ggplot(sl_Tirosh@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./tSNE_cell_cycle_phase_cell_cycle_corrected.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh/tSNE_cell_cycle_phase_cell_cycle_corrected.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+ggplot(sl_Tirosh@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") + 
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./tSNE_conditions_cell_cycle_corrected.jpg", device = "jpeg", width = 6, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh/tSNE_conditions_cell_cycle_corrected.jpg" height="300" />
+Labeling by condition
+
+#### UMAP
+```{r, eval=FALSE}
+sl_Tirosh <- RunUMAP(sl_Tirosh, dims = 1:5)
+UMAP <- UMAPPlot(object = sl_Tirosh)
+sl_Tirosh@meta.data <- cbind(sl_Tirosh@meta.data, UMAP$data[, grep("UMAP", colnames(UMAP$data))])
+rm(UMAP)
+
+ggplot(sl_Tirosh@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./UMAP_cell_cycle_phase_cell_cycle_corrected.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh/UMAP_cell_cycle_phase_cell_cycle_corrected.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+ggplot(sl_Tirosh@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./UMAP_conditions_cell_cycle_corrected.jpg", device = "jpeg", width = 6, height = 4)
+
+save(sl_Tirosh, file = "../../sl_Tirosh.RData")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh/UMAP_conditions_cell_cycle_corrected.jpg" height="300" />
+Labeling by condition
+
+
+
+
+## Ad-hoc selected cell-cycle marker-genes
+### Create an unique set of marker-genes combining the ones from the 2 papers
+```{r, eval=FALSE}
+cc <- read.table("path/to/directory/Macosko_EZ_2015_Table_S2_Cell_cycle_genes_human.csv", head = T, sep = ",", stringsAsFactors = F)
+
+cc_list <- list(G1_S = select(org.Hs.eg.db, keys = cc$G1.S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2], 
+                G2_M = select(org.Hs.eg.db, keys = cc$G2.M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                S = select(org.Hs.eg.db, keys = cc$S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                M = select(org.Hs.eg.db, keys = cc$M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2],
+                M_G1 = select(org.Hs.eg.db, keys = cc$M.G1, columns = "ENSEMBL", keytype = "SYMBOL")[, 2]
+)
+
+cc <- read.table("path/to/directory/Cell_Cycle_genes_human.csv", head = T, sep = ",", stringsAsFactors = F)
+
+cc_list$G1_S <- c(cc_list$G1_S, select(org.Hs.eg.db, keys = cc$G1.S, columns = "ENSEMBL", keytype = "SYMBOL")[, 2]) # combine the 2 marker-genes sets
+cc_list$G2_M <- c(cc_list$G2_M, select(org.Hs.eg.db, keys = cc$G2.M, columns = "ENSEMBL", keytype = "SYMBOL")[, 2]) # combine the 2 marker-genes sets
+
+cc_list <- lapply(cc_list, 
+                  function(x) {
+                    x <- x[! is.na(x)]
+                    x <- x[! duplicated(x)]
+                    return(x)
+                    }
+                  )
+cc <- Reduce("c", cc_list)
+```
+
+### Test each transcript expression if greater in each cell-cycle phase
+In this step the normalized gene expression (from section 3.2) must be used. The raw count cannot be used since the expression of each transcript correlates with the 'total' UMI count on that particular cell (cells with a high UMI count will tend to have higher counts in all transcripts). This can be an important cause of noise when comparing the transcript'e expression in different cells (for example in different cell-cycle phases). Thoretically, both the normalized dataset and the normalized-scaled datasets are suited for this analysis. The former is chosen in this tutorial.
+```{r, eval=FALSE}
+names(cc) <- lapply(names(cc_list), function(nm) rep(nm, length(cc_list[[nm]]))) %>% Reduce(f = "c")
+
+cc <- cc[cc %in% rownames(sl[["RNA"]]@data)]
+cc_data <- as.matrix(sl[["RNA"]]@data[cc, ]) # sl[["RNA"]]@data --> normalized dataset (the normalized-scaled is: sl[["RNA"]]@scale.data)
+```
+
+In the next section we check the actual expression of each transcript in cells from the 3 different cell-cycle phases
+```{r, eval=FALSE}
+dir.create("path/to/directory/Plots/cell_cycle_boxplots")
+
+lapply(1:nrow(cc_data), function(i) {
+  jpeg(paste0("path/to/directory/Plots/cell_cycle_boxplots/", names(cc)[i], "_", rownames(cc_data)[i], ".jpeg"), width = 180, height = 500)
+  par(mar=c(3,2,3,1))  
+  boxplot(split(cc_data[i, ], sl@meta.data$Phase), 
+          main = rownames(cc_data)[i], 
+          col = c("#F2AE48", "#7A9FB6", "#B678AF"), 
+          border = c("#F2AE48", "#7A9FB6", "#B678AF"), 
+          bty = "n", lty = 1, medcol = "white", staplelty = 0, lwd = 2, medlwd = 2, boxlty = 1
+  )
+  dev.off()
+  }
+)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots/S_ENSG00000101773.jpeg" height="300" />
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots/S_ENSG00000108773.jpeg" height="300" />
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots/S_ENSG00000134294.jpeg" height="300" />
+<br>
+
+Here, 3 examples of 3 different possibilities regarding the quality of a marker-gene are shown. These 3 transcripts are all annotated as S-phase markers. Out of the 3, only the first one (ENSG00000101773) shows consistenttly higher expression in S-phase, the other 2 are either not expressed, or not really fitting the definition of a marker-gene. Fortunately, an eye-inspection of a small number of transcript reveales that the majority of them belong to the first type, which explains why the cell-cycle correction still works on our cell-type
+
+
+The purpose of the test is to identify a certain transcript as marker of a given cell-cycle phase. The logic of the process is extremely simple: we want to test (independently for every transcript) that the transcript's expression is greater in cells that are in a particular cell-cycle phase (S or G2-M) than in all of the other cells (that are not in that particular phase). <br>
+Due to the fact that on the scaled dataset the expression (for most transcripts) is not normally distributed, the parametric approaces are likely not to perform well since one of the most important assumption is violated. For this reason a non-parametric test (such as Wilcoxon from the 'stats' package) is preferred.
+
+
+```{r, eval=FALSE}
+tests <- sapply(1:nrow(cc_data), function(i) {
+  # this blosk will divide the i-th transcript expression value into these 4 groups
+  S <- cc_data[i, ][sl@meta.data$Phase == "S"] 
+  No_S <- cc_data[i, ][sl@meta.data$Phase != "S"]
+  G2M <- cc_data[i, ][sl@meta.data$Phase == "G2M"]
+  No_G2M <- cc_data[i, ][sl@meta.data$Phase != "G2M"]
+  # The block below will generate a vector of length 5, sapply will 'cbind' those vectors into a 5 X n-transcripts matrix, after that t() will transpose 
+  tests <- c(
+    S_test = wilcox.test(x = S, y = No_S, alternative = "greater")$p.value, # column 1
+    G2_test = wilcox.test(x = G2M, y = No_G2M, alternative = "greater")$p.value, # column 2
+    S_vs_G2M = wilcox.test(x = S, y = G2M, alternative = "greater")$p.value, # column 3
+    G2M_vs_S = wilcox.test(x = G2M, y = S, alternative = "greater")$p.value, # column 4
+    Mean_expression = mean(cc_data[i, ]) # column 5 
+  )
+}) %>% t()
+
+rownames(tests) <- rownames(cc_data)
+
+# The actual marker's selection needs tuning (in terms of p-values) for probably each single-cell RNA-seq experiment. 
+# It is possible that datasets with lower number of cells (hundreds instead of thousands) will never reach p-values so low
+S_markers <- rownames(tests[-log(tests[, 1], 10) > 20 & -log(tests[, 3], 10) > 1.5, ]) # --> - log(S_test p-val) > 20 and  - log(S_vs_G2M p-val) > 1.5
+G2M_markers <- rownames(tests[-log(tests[, 2], 10) > 70 & -log(tests[, 4], 10) > 4, ]) # --> - log(G2_test p-val) > 70 and  - log(G2M_vs_S p-val) > 4
+```
+
+### Diagnostics plots for each transcript
+#### S-phase
+```{r, eval=FALSE}
+dir.create("path/to/directory/Plots/cell_cycle_boxplots_selected")
+
+lapply(1:nrow(cc_data[rownames(cc_data) %in% S_markers, ]), function(i) {
+  jpeg(paste0("path/to/directory/Plots/cell_cycle_boxplots_selected/S_", rownames(cc_data[rownames(cc_data) %in% S_markers, ])[i], ".jpeg"), 
+       width = 180, height = 500
+       )
+  par(mar=c(3,2,3,1))  
+  boxplot(split(cc_data[rownames(cc_data) %in% S_markers, ][i, ], sl@meta.data$Phase), 
+          main = rownames(cc_data[rownames(cc_data) %in% S_markers, ])[i], 
+          bty = "n", 
+          col = c("#F2AE48", "#7A9FB6", "#B678AF"), # "#3A9E60", "#7A9FB6", "#B678AF", "#DA5F5F", "#F2AE48"
+          border = c("#F2AE48", "#7A9FB6", "#B678AF"), 
+          lty = 1, medcol = "white", staplelty = 0, lwd = 2, medlwd = 2, boxlty = 1
+          )
+  dev.off()
+  }
+)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots_selected/S_ENSG00000132646.jpeg" height="300" />
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots_selected/S_ENSG00000228716.jpeg" height="300" />
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots_selected/S_ENSG00000094916.jpeg" height="300" />
+
+
+#### G2-M-phase
+```{r, eval=FALSE}
+lapply(1:nrow(cc_data[rownames(cc_data) %in% G2M_markers, ]), function(i) {
+  jpeg(paste0("path/to/directory/Plots/cell_cycle_boxplots_selected/G2M_", rownames(cc_data[rownames(cc_data) %in% G2M_markers, ])[i], ".jpeg"), 
+       width = 180, height = 500
+       )
+  par(mar=c(3,2,3,1))  
+  boxplot(split(cc_data[rownames(cc_data) %in% G2M_markers, ][i, ], sl@meta.data$Phase), 
+          main = rownames(cc_data[rownames(cc_data) %in% S_markers, ])[i], 
+          bty = "n", 
+          col = c("#F2AE48", "#7A9FB6", "#B678AF"), # "#3A9E60", "#7A9FB6", "#B678AF", "#DA5F5F", "#F2AE48"
+          border = c("#F2AE48", "#7A9FB6", "#B678AF"), 
+          lty = 1, medcol = "white", staplelty = 0, lwd = 2, medlwd = 2, boxlty = 1
+          )
+  dev.off()
+  }
+)
+
+rm(list = c("cc", "cc_data", "cc_list", "tests"))
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots_selected/G2M_ENSG00000117399.jpeg" height="300" />
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots_selected/G2M_ENSG00000164611.jpeg" height="300" />
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/cell_cycle_boxplots_selected/G2M_ENSG00000088986.jpeg" height="300" />
+
+<br>
+These examples show  some common cases of expression pattern selected with the method described (almost all transcripts fit the definition of a marker-gene).
+
+
+### Cell-Cycle scoring
+```{r, eval=FALSE}
+dir.create("path/to/directory/Plots/Reselected")
+setwd("path/to/directory/Plots/Reselected")
+
+sl_reselected <- sl
+sl_reselected@meta.data <- sl_reselected@meta.data[, 1:14]
+
+sl_reselected <- CellCycleScoring(sl_reselected, s.features = S_markers, g2m.features = G2M_markers, set.ident = TRUE) #### final cell cycle scoring
+
+sl_reselected <- RunPCA(sl_reselected, features = c(cc_list$G1_S, cc_list$G2_M, cc_list$S, cc_list$M, cc_list$M_G1))
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_not_corrected.jpg")
+  PCAPlot(object = sl_reselected, dims = c(1,2), pt.size = 2)
+dev.off()
+```
+
+### Cell-cycle correction
+```{r, eval=FALSE}
+sl_reselected <- ScaleData(sl_reselected, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(sl_reselected)) 
+
+sl_reselected <- RunPCA(sl_reselected, features = c(S_markers, G2M_markers))
+
+jpeg("./PCA_cell_cycle_genes_cell_cycle_corrected.jpg")
+  PCAPlot(object = sl_reselected, dims = c(1,2), pt.size = 2)
+dev.off()
+
+rm(list = c("S_markers", "G2M_markers"))
+```
+
+
+### Dimension reduction: 
+#### Find variable genes and run the PCA
+```{r, eval=FALSE}
+sl_reselected@meta.data[, "old.ident"] <- sl_reselected@meta.data[, "orig.ident"]
+sl_reselected@meta.data[, "old.ident"] <- revalue(sl_reselected@meta.data[, "old.ident"], c("Sample1"="DMSO_PMA-", "Sample2"="DMSO_PMA+","Sample4"="iBET_PMA+"))
+sl_reselected@active.ident <- sl_reselected@meta.data[, "old.ident"]
+names(sl_reselected@active.ident) <- rownames(sl_reselected@meta.data)  
+
+sl_reselected <- FindVariableFeatures(object = sl_reselected, 
+                                      mean.function = ExpMean, 
+                                      dispersion.function = LogVMR, 
+                                      mean.cutoff = c(0.025, 8)
+)
+
+jpeg("./Variable_features_cell_cycle_corrected.jpg")
+VariableFeaturePlot(sl_reselected)
+dev.off()
+
+sl_reselected <- RunPCA(object = sl_reselected, features = sl_reselected[["RNA"]]@var.features, do.print = F, pcs.compute = 100)
+
+jpeg("./PCA_top_variable_genes_cell_cycle_corrected.jpg")
+PCAPlot(object = sl_reselected, dims = c(1,2), pt.size = 2)
+dev.off()
+
+jpeg("./PCA_top_variable_genes_PC1_PC3_cell_cycle_corrected.jpg")
+PCAPlot(object = sl_reselected, dims = c(1,3), pt.size = 2)
+dev.off()
+```
+
+
+```{r, eval=FALSE}
+jpeg("./PCA_top_variable_genes_component_loadings_cell_cycle_corrected.jpg")
+barplot(sl_reselected[["pca"]]@stdev^2 / sum(sl_reselected[["pca"]]@stdev^2), 
+        names.arg = paste("PC ", 1:length(sl_reselected[["pca"]]@stdev)), 
+        las = 2, 
+        cex.names = 0.5, 
+        ylab = "Proportion of variance explained"
+)
+dev.off()
+```
+
+#### tSNE
+```{r, eval=FALSE}
+sl_reselected <- RunTSNE(object = sl_reselected, dims = 1:5)
+
+tsne <- TSNEPlot(object = sl_reselected)
+sl_reselected@meta.data <- cbind(sl_reselected@meta.data, tsne$data)
+rm(tsne)
+
+ggplot(sl_reselected@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./tSNE_cell_cycle_phase_cell_cycle_corrected.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected/tSNE_cell_cycle_phase_cell_cycle_corrected.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+ggplot(sl_reselected@meta.data, aes(tSNE_1, tSNE_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./tSNE_conditions_cell_cycle_corrected.jpg", device = "jpeg", width = 6, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected/tSNE_conditions_cell_cycle_corrected.jpg" height="300" />
+Labeling by condition
+
+#### UMAP
+```{r, eval=FALSE}
+sl_reselected <- RunUMAP(sl_reselected, dims = 1:5)
+UMAP <- UMAPPlot(object = sl_reselected)
+sl_reselected@meta.data <- cbind(sl_reselected@meta.data, UMAP$data[, grep("UMAP", colnames(UMAP$data))])
+rm(UMAP)
+
+ggplot(sl_reselected@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(Phase))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Accent") +
+  ggsave(filename = "./UMAP_cell_cycle_phase_cell_cycle_corrected.jpg", device = "jpeg", width = 5, height = 4)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected/UMAP_cell_cycle_phase_cell_cycle_corrected.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+ggplot(sl_reselected@meta.data, aes(UMAP_1, UMAP_2, group=factor(ident), color= factor(old.ident))) +
+  geom_point(size=1) +
+  labs(color="Clusters") +
+  scale_color_brewer(palette="Set2") +
+  ggsave(filename = "./UMAP_conditions_cell_cycle_corrected.jpg", device = "jpeg", width = 6, height = 4)
+
+save(sl_reselected, file = "../../sl_reselected.RData")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected/UMAP_conditions_cell_cycle_corrected.jpg" height="300" />
+Labeling by condition
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Final stats
+## Within and between datasets comparisons
+### Integration of the phase classification metadata from each datasets 
+```{r, eval=FALSE}
+setwd("path/to/directory")
+
+sl_Macosko@meta.data$Agreement <- sl_Macosko$Phase == sl_Tirosh$Phase # for the correction based on the paper, Agreement is defined just between the 2 datasets
+sl_Tirosh@meta.data$Agreement <- sl_Macosko$Phase == sl_Tirosh$Phase
+sl_reselected@meta.data$Agreement <- sl_reselected$Phase == sl_Tirosh$Phase & sl_Tirosh$Agreement # for the correction based on the ad-hoc method, Agreement is defined between all 3 datasets
+
+sl_Macosko@meta.data$Tirosh_Phase <- sl_Tirosh$Phase
+sl_Tirosh@meta.data$Macosko_Phase <- sl_Macosko$Phase
+
+sl_reselected@meta.data$Tirosh_Phase <- sl_Tirosh$Phase
+sl_reselected@meta.data$Macosko_Phase <- sl_Macosko$Phase
+```
+
+### Cell-cycle phase stats 
+The purpose of this diagnostic is to determine wether the sets of marker genes used for the correction cause different proportions of cells classified in each phase.
+```{r, eval=FALSE}
+plot_phase_stats <- function(dataset) {
+  ggplot(data = dataset, mapping = aes(x= old.ident, fill = Phase), stat = "count", position = "fill") + 
+  scale_fill_brewer(palette="Accent") +
+  xlab("") +
+  theme(plot.title = element_text(color = "grey50", size = 22),
+        axis.title.y = element_text(color = "grey50", size = 16),
+        axis.text.x = element_text(color = "grey50", size = 16, angle = 90),
+        axis.text.y = element_text(color = "grey50", size = 16),
+        legend.title = element_text(color = "grey50", size = 16),
+        legend.text = element_text(color = "grey50", size = 16),
+        panel.background = element_rect(fill = 'white', colour = 'white')) +
+  geom_bar(position = "fill") 
+}
+```
+
+
+```{r, eval=FALSE}
+plot_phase_stats(sl_Macosko@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko_Phase_vs_treatment_stats.jpg" height="200" />
+
+```{r, eval=FALSE}
+plot_phase_stats(sl_Tirosh@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh_Phase_vs_treatment_stats.jpg" height="200" />
+
+```{r, eval=FALSE}
+plot_phase_stats(sl_reselected@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected_Phase_vs_treatment_stats.jpg" height="200" />
+
+<br>
+To be noted from these examples the agreement between the individual datasets showing a reduction of cells in S phase in condition 2 and condition 3. This is one example of a type of information provided by the single-cell based methods that is not obtainable from 'bulk' methods.
+
+### Cell-cycle phase assignment
+In this section we show how Seurat assign each cell to a cell-cycle phase. A substantial amount of cells is found close to the boundary regions, even though these cells occupy a state in between 2 cell-cycle phases, Seurat still assign them to 1 phase. This is possibly one of the reasons why it might be more accurate to perform the correction using the scores instead of the categorical values.
+
+```{r, eval=FALSE}
+plot_G2M_vs_S <- function(dataset) {
+  ggplot(data = dataset, mapping = aes(x= S.Score, y=G2M.Score, colour = Phase)) + 
+  scale_color_brewer(palette="Accent") +
+  theme(plot.title = element_text(color = "grey50", size = 16),
+        axis.title.y = element_text(color = "grey50", size = 16),
+        axis.title.x = element_text(color = "grey50", size = 16),
+        axis.text.x = element_text(color = "grey50", size = 16, angle = 90),
+        axis.text.y = element_text(color = "grey50", size = 16),
+        legend.title = element_text(color = "grey50", size = 16),
+        legend.text = element_text(color = "grey50", size = 16)) +
+  geom_point()
+}
+```
+
+
+```{r, eval=FALSE}
+plot_G2M_vs_S(sl_reselected@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected_Phase_scores.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_G2M_vs_S(sl_Macosko@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko_Phase_scores.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_G2M_vs_S(sl_Tirosh@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh_Phase_scores.jpg" height="300" />
+
+
+### Consistency in the cell-cycle phases classifications (between the different datasets) 
+This section shows that in most cases, the lack of agreement between the different corrections happens to those cells that are located nearby the assignment boundaries.
+
+```{r, eval=FALSE}
+plot_G2M_vs_S_consistency <- function(dataset) {
+  ggplot(data = dataset, mapping = aes(x= S.Score, y=G2M.Score, colour = Agreement)) + 
+  scale_color_brewer(palette="Pastel1") +
+  theme(plot.title = element_text(color = "grey50", size = 16),
+        axis.title.y = element_text(color = "grey50", size = 16),
+        axis.title.x = element_text(color = "grey50", size = 16),
+        axis.text.x = element_text(color = "grey50", size = 16, angle = 90),
+        axis.text.y = element_text(color = "grey50", size = 16),
+        legend.title = element_text(color = "grey50", size = 16),
+        legend.text = element_text(color = "grey50", size = 16)) +
+  geom_point()
+}
+```
+
+
+```{r, eval=FALSE}
+plot_G2M_vs_S_consistency(sl_reselected@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected_Agreement.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_G2M_vs_S_consistency(sl_Macosko@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko_Agreement.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_G2M_vs_S_consistency(sl_Tirosh@meta.data)
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh_Agreement.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_phase_stats_between_datasets <- function(dataset, fill, title) {
+  ggplot(data = sl_Macosko@meta.data, mapping = aes(x= Phase, fill = Tirosh_Phase), stat = "count", position = "fill") + 
+  scale_fill_brewer(palette="Accent") +
+  xlab("") +
+  ggtitle(title) +
+  theme(plot.title = element_text(color = "grey50", size = 16),
+        axis.title.y = element_text(color = "grey50", size = 16),
+        axis.text.x = element_text(color = "grey50", size = 16, angle = 90),
+        axis.text.y = element_text(color = "grey50", size = 16),
+        legend.title = element_text(color = "grey50", size = 16),
+        legend.text = element_text(color = "grey50", size = 16),
+        panel.background = element_rect(fill = 'white', colour = 'white')) +
+  geom_bar() 
+}
+```
+
+
+```{r, eval=FALSE}
+plot_phase_stats_between_datasets(dataset = sl_Macosko@meta.data, fill = Tirosh_Phase, title = "Macosko Classification")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Macosko_vs_Tirosh_Phase_stats.jpg" height="300" />
+
+
+
+```{r, eval=FALSE}
+plot_phase_stats_between_datasets(dataset = sl_Tirosh@meta.data, fill = Macosko_Phase, title = "Tirosh Classification")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Tirosh_vs_Macosko_Phase_stats.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_phase_stats_between_datasets(dataset = sl_reselected@meta.data, fill = Tirosh_Phase, title = "Reselected Markers Classification")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected_vs_Tirosh_Phase_stats.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+plot_phase_stats_between_datasets(dataset = sl_reselected@meta.data, fill = Macosko_Phase, title = "Reselected Markers Classification")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Reselected_vs_Macosko_Phase_stats.jpg" height="300" />
+
+
+
+## Distribution of the gene-expression variation between conditions and cell-cycle phase 
+
+This is probably the most interesting aspect of the workflow. Here we are going to assess for each transcript how the variability in expression is distributed between the factors (coefficients in the model). While up to now we assessed the 'goodness' of the cell-cycle correction by simply looking at the tSNA (or UMAP) and check that the cell clustering driven by the cell cycle is disappeared, here we aim to quantify this factor. <br>
+
+To do this we need to fit a linear model for each transcript and then call the anova function (the cell cycle phase is labeled simply as 'Phase' in the plots below). <br> <br> 
+
+Regarding the linear model, the estimate of the coefficients is done using the standard OLS method in R. Since we are not interested in the statistics of the model(confidence intervals, p-values et.) the 'lm' method is preferred over a GLM due to performance reasons. A possible solution for this could be to fit a GLM model running it in parallel on several cores on a server, however, this is not necessary for the purpose of this study. Another consideration regards the interaction terms, as shown in all the cases, they do not explain a large amount of variability. A good approach in general would be to repeat the model fitting without those coefficients. The reason why they were kept is simply because they use a small amount of degrees of freedom ("PMA:Phase" = 1 * 2 df; "treatment:Phase" = 2 * 2 df). This dataset is composed of ~4500 cells (for this model, df = toatal cells -1). Removing those terms won't have any impact on the coefficient estimate. <br> <br> 
+
+Regarding the ANOVA instead, here we used the standard type I anova function in R. Due to the fact that the cell-cycle phases and the different conditions are fairly balanced we do not need to worry about colinearity between the predictors.
+
+
+
+```{r, eval=FALSE}
+setwd("path/to/directory")
+
+anova_from_seurat <- function(seurat_object){
+  seurat_object@meta.data$Treatment_group <- paste(seurat_object$PMA, seurat_object$treatment)
+  
+  print("fitting lm") # fit 1 linear model per transcript (row)
+  lm_seurat_object <- apply(
+    seurat_object[["RNA"]]@scale.data, 
+    MARGIN = 1, 
+    FUN = function(x) lm(x ~  seurat_object$treatment + seurat_object$PMA + seurat_object$Phase + seurat_object$PMA:seurat_object$Phase + seurat_object$treatment:seurat_object$Phase)
+  )
+  
+  print("anova")
+  anova_seurat_object <- sapply(
+      lm_seurat_object, 
+      function(x) {
+        y <- anova(x)
+        z <- sqrt(y$`Mean Sq`) # take the square root of 'mean squared error' so it has the dimension of a standard deviation  
+        names(z) <- rownames(y)
+        z
+      }
+    ) %>% t()
+  
+  anova_seurat_object_percent <- apply(anova_seurat_object, MARGIN = 1, FUN = function(x) 100* x/(sum(x))) %>% t()
+  
+  colnames(anova_seurat_object_percent) <- sapply(
+    colnames(anova_seurat_object_percent), 
+    function(x) gsub(pattern = "seurat_object\\$", replacement = "", x = x)
+  )
+  
+  print("making data frame")
+  anova_seurat_object_percent_data_frame <- data.frame(
+    Standard_deviation_percentage = Reduce("c", anova_seurat_object_percent), 
+    Coefficient = factor(
+      rep(colnames(anova_seurat_object_percent), each = nrow(anova_seurat_object_percent)), 
+      levels = colnames(anova_seurat_object_percent)
+    )
+  )
+  
+  list(anova_seurat_object_percent, anova_seurat_object_percent_data_frame)
+}
+
+Anova_Macosko <- anova_from_seurat(sl_Macosko)
+Anova_Tirosh <- anova_from_seurat(sl_Tirosh)
+Anova_Reselected <- anova_from_seurat(sl_reselected)
+Anova_Uncorrected <- anova_from_seurat(sl)
+```
+
+
+```{r, eval=FALSE}
+ggplot(Anova_Uncorrected[[2]], aes(x = Standard_deviation_percentage, fill = Coefficient, colour = Coefficient)) + 
+  geom_density(alpha = 0.3) + 
+  ggsave("./Plots/Anova_Uncorrected.jpg", width = 18, height = 10, units = "cm", device = "jpeg")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Anova_Uncorrected_post_correction.jpg" height="300" />
+
+The variation in gene-expression related to the cell-cycle although not as large as between the different experimental conditions, is still a significant source of variability  
+
+```{r, eval=FALSE}
+ggplot(Anova_Macosko[[2]], aes(x = Standard_deviation_percentage, fill = Coefficient, colour = Coefficient)) + 
+  geom_density(alpha = 0.3) + 
+  ggsave("./Plots/Anova_Macosko_post_correction.jpg", width = 18, height = 10, units = "cm", device = "jpeg")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Anova_Macosko_post_correction.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+ggplot(Anova_Tirosh[[2]], aes(x = Standard_deviation_percentage, fill = Coefficient, colour = Coefficient)) + 
+  geom_density(alpha = 0.3) + 
+  ggsave("./Plots/Anova_Tirosh_post_correction.jpg", width = 18, height = 10, units = "cm", device = "jpeg")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Anova_Tirosh_post_correction.jpg" height="300" />
+
+
+```{r, eval=FALSE}
+ggplot(Anova_Reselected[[2]], aes(x = Standard_deviation_percentage, fill = Coefficient, colour = Coefficient)) + 
+  geom_density(alpha = 0.3) + 
+  ggsave("./Plots/Anova_Reselected_post_correction.jpg", width = 18, height = 10, units = "cm", device = "jpeg")
+```
+<img src="C:/Users/mp674001/OneDrive - GSK/Desktop/Plots/Anova_Reselected_post_correction.jpg" height="300" />
+
+From the last 3 panels it is clear that all sets of marker genes allow for an efficient removal of the cell-cycle related variation. 
+
+```{r}
+sessionInfo()
+```
+
